@@ -784,10 +784,12 @@
     };
 
     /**
-     * Session Storage (Strictly In-Memory Only — Never Stored in localStorage or cookies)
+     * Workday session:
+     * Persist only the opaque server-issued session token in Local Storage.
+     * Never store the Google ID token or user role on the client.
      */
     const WORKDAY_SESSION_KEY = 'vectored_workday_session_v1';
-    let inMemorySessionToken = localStorage.getItem(WORKDAY_SESSION_KEY) || null;
+    let inMemorySessionToken = null;
 
     /**
      * Authenticated Backend Adapter (Netlify Function proxy)
@@ -1050,38 +1052,84 @@
       showToast(label, 'success');
     }
 
+    // Restore the opaque server-issued workday session after every page load.
+    // Read Local Storage at restore time (not only once during script evaluation)
+    // so the in-memory adapter always receives the persisted credential.
     window.addEventListener('load', async () => {
       initGis();
       renderAll();
-      await BackendAdapter.checkConnection();
+
+      // Do not make session restoration depend on the optional health-check request.
+      // A slow health check must not prevent the authenticated session from loading.
+      const connectionCheck = BackendAdapter.checkConnection();
       await restoreWorkdaySession();
+      await connectionCheck;
     });
 
     async function restoreWorkdaySession() {
-      if (!inMemorySessionToken) return;
+      let storedToken = null;
+
+      try {
+        storedToken = localStorage.getItem(WORKDAY_SESSION_KEY);
+      } catch (storageError) {
+        console.error('[Session Restore] Local Storage is unavailable:', storageError);
+        setLoginError('Your browser is blocking local session storage. Enable site data for this website, then sign in again.');
+        return false;
+      }
+
+      if (!storedToken) {
+        inMemorySessionToken = null;
+        return false;
+      }
+
+      // Rehydrate the token used by BackendAdapter.execute().
+      inMemorySessionToken = storedToken;
+
       try {
         const res = await BackendAdapter.fetchInitialData();
-        if (res && res.success && res.data && res.data.user) {
-          state.currentUser = res.data.user;
-          state.activeView = state.currentUser.role === 'founder' ? 'founder-dashboard' : 'staff-dashboard';
-          applyInitialData(res.data);
+
+        // Apps Script deployments may wrap the payload in `data`; accept the
+        // documented envelope and the equivalent direct-user envelope.
+        const payload = (res && res.data && typeof res.data === 'object') ? res.data : res;
+        const restoredUser = payload && (
+          payload.user ||
+          payload.currentUser ||
+          (res && res.user)
+        );
+
+        if (res && res.success !== false && restoredUser) {
+          state.currentUser = restoredUser;
+          state.activeView = restoredUser.role === 'founder' ? 'founder-dashboard' : 'staff-dashboard';
+          applyInitialData(payload);
           renderAll();
+          setLoginError('');
           showToast('Your workday session has been restored.', 'success');
+          return true;
         }
+
+        // A successful HTTP response without an identifiable user is not
+        // treated as a valid login; keep the credential for diagnosis.
+        console.error('[Session Restore] Unexpected backend response:', res);
+        setLoginError('Your saved session could not be verified. Please sign in again.');
+        return false;
       } catch (err) {
         const message = String(err && err.message || '').toLowerCase();
-        const sessionRejected = /expired|invalid session|session missing|inactive|no longer authorized|access denied/.test(message);
+        const sessionRejected = /expired|invalid session|session missing|inactive|no longer authorized|access denied|authentication error/.test(message);
+
         if (sessionRejected) {
-          localStorage.removeItem(WORKDAY_SESSION_KEY);
+          try { localStorage.removeItem(WORKDAY_SESSION_KEY); } catch (_) {}
           inMemorySessionToken = null;
           state.currentUser = null;
           renderAll();
+          setLoginError('Your workday session has expired or is no longer authorized. Please sign in again.');
         } else {
-          // Preserve the opaque credential on transient network/proxy failures so a slow connection
-          // or accidental refresh does not force a new Google sign-in.
-          showToast('Connection is slow or unavailable. Your workday session is saved and can be restored when the connection returns.', 'error');
+          // Keep the token on temporary proxy/network errors; do not force re-login.
+          setLoginError('Could not reconnect to your saved session. Check your connection and refresh this page. Your saved session has been retained.');
+          showToast('Session restore could not reach the backend. Your saved session has been retained.', 'error');
         }
-        console.info('Stored workday session restore result:', err.message);
+
+        console.warn('[Session Restore] Request failed:', err);
+        return false;
       }
     }
 
@@ -1136,9 +1184,16 @@
       try {
         const authResult = await BackendAdapter.verifyIdToken(idToken);
         if (authResult && authResult.success && authResult.user) {
-          // Store only the opaque server-issued session credential (never the Google ID token).
+          // Persist only the opaque server-issued session credential (never the Google ID token).
+          if (!authResult.sessionToken) {
+            throw new Error('The backend authenticated your Google account but did not return a workday session token.');
+          }
+          try {
+            localStorage.setItem(WORKDAY_SESSION_KEY, authResult.sessionToken);
+          } catch (storageError) {
+            throw new Error('Your browser could not save the workday session. Enable site data for this website and try again.');
+          }
           inMemorySessionToken = authResult.sessionToken;
-          localStorage.setItem(WORKDAY_SESSION_KEY, authResult.sessionToken);
           state.currentUser = authResult.user;
           state.activeView = state.currentUser.role === 'founder' ? 'founder-dashboard' : 'staff-dashboard';
           await loadInitialAppData();
