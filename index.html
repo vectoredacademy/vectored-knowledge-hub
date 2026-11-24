@@ -774,7 +774,8 @@
     /* =========================================================================
        0. CONFIGURATION & WEB APP INTEGRATION CONSTANTS
        ========================================================================= */
-    const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwwH1tbntk_njClNZ7uHoR1492derbjNXgkQKp6vnfBSsS8XA8mTCOkS_8mrGAKL5PI/exec";
+    // Same-origin Netlify Function proxy; the proxy forwards requests to Apps Script.
+    const PROXY_ENDPOINT = '/.netlify/functions/knowledge-hub-api';
 
     const CONFIG = {
       GOOGLE_CLIENT_ID: '1039945107412-859cs0bhjau6bhgtlo815dung97j02n7.apps.googleusercontent.com',
@@ -788,43 +789,43 @@
     let inMemorySessionToken = null;
 
     /**
-     * Authenticated Backend Adapter (Web App URL fetch bridge)
-     * Compatible with Netlify cross-origin hosting.
-     * Uses text/plain Simple Requests to avoid OPTIONS preflight and read response JSON.
+     * Authenticated Backend Adapter (Netlify Function proxy)
+     * The same-origin proxy forwards requests to the Google Apps Script Web App.
      */
     const BackendAdapter = {
       isAvailable() {
-        return Boolean(WEB_APP_URL && WEB_APP_URL.indexOf('script.google.com') !== -1 && !WEB_APP_URL.includes('https://script.google.com/macros/s/AKfycbwwH1tbntk_njClNZ7uHoR1492derbjNXgkQKp6vnfBSsS8XA8mTCOkS_8mrGAKL5PI/exec'));
+        return Boolean(PROXY_ENDPOINT);
       },
 
       async checkConnection() {
         if (!this.isAvailable()) {
-          setBackendStatus('disconnected', 'Web App URL Not Configured');
+          setBackendStatus('disconnected', 'Netlify Proxy Not Configured');
           return false;
         }
 
         try {
           setBackendStatus('connecting', 'Connecting...');
-          const res = await fetch(`${WEB_APP_URL}?action=ping`);
+          const res = await fetch(PROXY_ENDPOINT, { method: 'GET' });
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}: Netlify proxy health check failed.`);
+          }
           const data = await res.json();
           if (data && data.success) {
-            setBackendStatus('connected', 'Web App Connected');
+            setBackendStatus('connected', 'Backend Online');
             return true;
-          } else {
-            setBackendStatus('disconnected', 'Backend Error');
-            return false;
           }
+          setBackendStatus('disconnected', 'Backend Error');
+          return false;
         } catch (err) {
-          console.warn('[Backend Ping Failed]:', err);
-          setBackendStatus('disconnected', 'Web App Offline');
+          console.warn('[Proxy Ping Failed]:', err);
+          setBackendStatus('disconnected', 'Proxy Offline');
           return false;
         }
       },
 
       async execute(action, payload = null, requireToken = true) {
         if (!this.isAvailable()) {
-          console.warn(`[Backend Bridge] Cannot execute '${action}'. WEB_APP_URL not configured.`);
-          throw new Error('Backend Web App URL is not configured. Please configure WEB_APP_URL in updated_frontend.html.');
+          throw new Error('Netlify Function proxy endpoint is not configured.');
         }
 
         if (requireToken && !inMemorySessionToken) {
@@ -840,20 +841,20 @@
         setBackendStatus('connecting', 'Processing...');
 
         try {
-          const response = await fetch(WEB_APP_URL, {
+          const response = await fetch(PROXY_ENDPOINT, {
             method: 'POST',
             headers: {
-              'Content-Type': 'text/plain;charset=utf-8'
+              'Content-Type': 'application/json'
             },
             body: JSON.stringify(requestBody)
           });
 
           if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: Failed to reach Google Apps Script Web App.`);
+            throw new Error(`HTTP ${response.status}: Failed to reach Netlify Function proxy.`);
           }
 
           const result = await response.json();
-          setBackendStatus('connected', 'Web App Connected');
+          setBackendStatus('connected', 'Backend Online');
 
           if (result && result.success === false) {
             throw new Error(result.error || 'The backend operation was denied.');
