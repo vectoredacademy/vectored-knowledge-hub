@@ -786,7 +786,8 @@
     /**
      * Session Storage (Strictly In-Memory Only — Never Stored in localStorage or cookies)
      */
-    let inMemorySessionToken = null;
+    const WORKDAY_SESSION_KEY = 'vectored_workday_session_v1';
+    let inMemorySessionToken = localStorage.getItem(WORKDAY_SESSION_KEY) || null;
 
     /**
      * Authenticated Backend Adapter (Netlify Function proxy)
@@ -870,7 +871,11 @@
 
       // Public Operations
       verifyIdToken(idToken) {
-        return this.execute('verifyGoogleIdToken', { idToken: idToken }, false);
+        return this.execute('createWorkdaySession', { idToken: idToken }, false);
+      },
+
+      revokeWorkdaySession() {
+        return this.execute('logoutWorkdaySession', {}, true);
       },
 
       submitAccessRequest(payload) {
@@ -1045,11 +1050,40 @@
       showToast(label, 'success');
     }
 
-    window.addEventListener('load', () => {
+    window.addEventListener('load', async () => {
       initGis();
       renderAll();
-      BackendAdapter.checkConnection();
+      await BackendAdapter.checkConnection();
+      await restoreWorkdaySession();
     });
+
+    async function restoreWorkdaySession() {
+      if (!inMemorySessionToken) return;
+      try {
+        const res = await BackendAdapter.fetchInitialData();
+        if (res && res.success && res.data && res.data.user) {
+          state.currentUser = res.data.user;
+          state.activeView = state.currentUser.role === 'founder' ? 'founder-dashboard' : 'staff-dashboard';
+          applyInitialData(res.data);
+          renderAll();
+          showToast('Your workday session has been restored.', 'success');
+        }
+      } catch (err) {
+        const message = String(err && err.message || '').toLowerCase();
+        const sessionRejected = /expired|invalid session|session missing|inactive|no longer authorized|access denied/.test(message);
+        if (sessionRejected) {
+          localStorage.removeItem(WORKDAY_SESSION_KEY);
+          inMemorySessionToken = null;
+          state.currentUser = null;
+          renderAll();
+        } else {
+          // Preserve the opaque credential on transient network/proxy failures so a slow connection
+          // or accidental refresh does not force a new Google sign-in.
+          showToast('Connection is slow or unavailable. Your workday session is saved and can be restored when the connection returns.', 'error');
+        }
+        console.info('Stored workday session restore result:', err.message);
+      }
+    }
 
     function initGis() {
       const wrapper = document.getElementById('gis-button-wrapper');
@@ -1102,8 +1136,9 @@
       try {
         const authResult = await BackendAdapter.verifyIdToken(idToken);
         if (authResult && authResult.success && authResult.user) {
-          // Store token in JavaScript memory only
-          inMemorySessionToken = idToken;
+          // Store only the opaque server-issued session credential (never the Google ID token).
+          inMemorySessionToken = authResult.sessionToken;
+          localStorage.setItem(WORKDAY_SESSION_KEY, authResult.sessionToken);
           state.currentUser = authResult.user;
           state.activeView = state.currentUser.role === 'founder' ? 'founder-dashboard' : 'staff-dashboard';
           await loadInitialAppData();
@@ -1123,26 +1158,26 @@
       if (!inMemorySessionToken) return;
       try {
         const res = await BackendAdapter.fetchInitialData();
-        if (res && res.success && res.data) {
-          const d = res.data;
-          if (d.prompts) state.prompts = d.prompts;
-          if (d.sops) state.sops = d.sops;
-          if (d.resources) state.resources = d.resources;
-          if (d.umiilaw) state.umiilaw = d.umiilaw;
-          if (d.users) state.users = d.users;
-          if (d.accessRequests) state.accessRequests = d.accessRequests;
-          if (d.qaRecords) state.qaRecords = d.qaRecords;
-          if (d.auditLogs) state.auditLogs = d.auditLogs;
-          if (d.versions) state.versions = d.versions;
-          if (d.cmsRecords) state.cmsRecords = d.cmsRecords;
-          if (d.design) {
-            state.design = Object.assign(state.design, d.design);
-            applyDesign();
-          }
-        }
+        if (res && res.success && res.data) applyInitialData(res.data);
       } catch (err) {
         showToast('Could not load data: ' + err.message, 'error');
       }
+    }
+
+
+    function applyInitialData(d) {
+      if (d.user) state.currentUser = d.user;
+      if (Array.isArray(d.prompts)) state.prompts = d.prompts;
+      if (Array.isArray(d.sops)) state.sops = d.sops;
+      if (Array.isArray(d.resources)) state.resources = d.resources;
+      if (Array.isArray(d.umiilaw)) state.umiilaw = d.umiilaw;
+      if (Array.isArray(d.users)) state.users = d.users;
+      if (Array.isArray(d.accessRequests)) state.accessRequests = d.accessRequests;
+      if (Array.isArray(d.qaRecords)) state.qaRecords = d.qaRecords;
+      if (Array.isArray(d.auditLogs)) state.auditLogs = d.auditLogs;
+      if (Array.isArray(d.versions)) state.versions = d.versions;
+      if (Array.isArray(d.cmsRecords)) state.cmsRecords = d.cmsRecords;
+      if (d.design) { state.design = Object.assign(state.design, d.design); applyDesign(); }
     }
 
     function setLoginError(msg) {
@@ -1157,7 +1192,9 @@
       if (el) el.classList.toggle('hidden', !isLoading);
     }
 
-    function logout() {
+    async function logout() {
+      try { if (inMemorySessionToken) await BackendAdapter.revokeWorkdaySession(); } catch (e) { console.warn('Server logout could not be confirmed:', e.message); }
+      localStorage.removeItem(WORKDAY_SESSION_KEY);
       inMemorySessionToken = null;
       state.currentUser = null;
       state.activeView = 'staff-dashboard';
@@ -1592,7 +1629,7 @@
     function renderSopLibrary() {
       const q = state.globalSearch;
       const items = state.sops.filter(s => {
-        if (!isFounder() && s.status !== 'published') return false;
+        if (String(s.status || '').toLowerCase().trim() !== 'published') return false;
         if (q && !(s.title + (s.description || '')).toLowerCase().includes(q)) return false;
         return true;
       });
@@ -1629,7 +1666,7 @@
       const platforms = ['ALL', 'ChatGPT', 'Gemini', 'Anki', 'NotebookLM'];
 
       const filtered = state.prompts.filter(p => {
-        if (!isFounder() && p.status !== 'published') return false;
+        if (String(p.status || '').toLowerCase().trim() !== 'published') return false;
         if (state.promptPlatformFilter !== 'ALL') {
           let plats = [];
           try { plats = JSON.parse(p.platforms_json || '[]'); } catch(e){}
@@ -1707,87 +1744,72 @@
       if (p) copyText(p.prompt_body, `Copied ${p.prompt_code} (${p.current_version}) verbatim.`);
     }
 
+    function getQuickGenerateFields(promptRecord) {
+      let configured = [];
+      try {
+        const raw = promptRecord.quick_generate_schema_json || '';
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          configured = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.fields) ? parsed.fields : []);
+        }
+      } catch (e) { console.warn('Invalid Quick Generate schema; falling back to prompt placeholders.', e); }
+      if (configured.length) return configured.map(f => ({
+        key: String(f.key || f.name || '').trim().replace(/^\[|\]$/g, ''),
+        label: String(f.label || f.key || f.name || 'Input'),
+        type: ['textarea','select','number','email','date'].includes(String(f.type || '').toLowerCase()) ? String(f.type).toLowerCase() : 'text',
+        required: f.required === true,
+        placeholder: String(f.placeholder || ''),
+        help: String(f.help || f.description || ''),
+        options: Array.isArray(f.options) ? f.options : []
+      })).filter(f => f.key);
+      const detected = extractPlaceholders(promptRecord.prompt_body || '');
+      return detected.tokens.map(token => ({ key: token, label: token.replace(/[_-]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase()), type:'text', required:false, placeholder:'Enter ' + token.toLowerCase().replace(/[_-]+/g,' ') , options:[] }));
+    }
+
+    function getQuickGenerateOutput(promptRecord) {
+      const fields = getQuickGenerateFields(promptRecord);
+      return substituteApprovedPlaceholders(promptRecord.prompt_body || '', fields.map(f=>f.key), state.quickGenValues || {});
+    }
+
     function renderQuickGenerate() {
-      const selected = state.prompts.find(p => p.prompt_id === state.selectedPromptId) || state.prompts[0];
-      if (!selected) return `<div class="card">No prompts available in the database.</div>`;
+      const availablePrompts = (state.prompts || []).filter(p => String(p.status || '').toLowerCase().trim() === 'published');
+      const selected = availablePrompts.find(p => p.prompt_id === state.selectedPromptId) || availablePrompts[0];
+      if (!selected) return `<div class="card">No published prompts are available. Ask the Founder to publish a prompt first.</div>`;
       state.selectedPromptId = selected.prompt_id;
-
-      const { tokens, counts } = extractPlaceholders(selected.prompt_body || '');
+      const fields = getQuickGenerateFields(selected);
       const showingOriginal = state.quickGenViewMode === 'original';
-
+      const missing = fields.filter(f => f.required && !String((state.quickGenValues || {})[f.key] || '').trim());
+      const inputHtml = fields.map((f, idx) => {
+        const value = (state.quickGenValues || {})[f.key] || '';
+        const label = `${idx+1}. ${escapeHtml(f.label)}${f.required ? ' *' : ''}`;
+        const help = f.help ? `<small class="card-meta">${escapeHtml(f.help)}</small>` : '';
+        if (f.type === 'textarea') return `<div class="form-group"><label class="form-label">${label}</label><textarea class="form-input" rows="3" placeholder="${escapeHtml(f.placeholder)}" oninput="updateQuickGenValue('${escapeHtml(f.key)}',this.value)">${escapeHtml(value)}</textarea>${help}</div>`;
+        if (f.type === 'select') return `<div class="form-group"><label class="form-label">${label}</label><select class="form-select" onchange="updateQuickGenValue('${escapeHtml(f.key)}',this.value)"><option value="">Select...</option>${f.options.map(o=>{const v=typeof o==='object'?o.value:o;const t=typeof o==='object'?o.label:o;return `<option value="${escapeHtml(v)}" ${String(value)===String(v)?'selected':''}>${escapeHtml(t)}</option>`;}).join('')}</select>${help}</div>`;
+        return `<div class="form-group"><label class="form-label">${label}</label><input class="form-input" type="${f.type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(f.placeholder)}" oninput="updateQuickGenValue('${escapeHtml(f.key)}',this.value)" />${help}</div>`;
+      }).join('');
+      const output = showingOriginal ? selected.prompt_body : getQuickGenerateOutput(selected);
       return `
-        <div class="page-header">
-          <div>
-            <h1>Prompt Detail & Quick Generate</h1>
-            <p class="page-subtitle">Deterministic variable substitution only. Replaces <code>[PLACEHOLDER]</code> tokens in local memory without external AI API calls.</p>
-          </div>
-          <div class="header-actions">
-            <button class="btn btn-outline" onclick="navigate('prompts')">← Back to Prompts</button>
-          </div>
-        </div>
-
-        <div class="card" style="margin-bottom:16px;">
-          <div class="grid-2" style="align-items:end;">
-            <div class="form-group" style="margin-bottom:0;">
-              <label class="form-label">Select Master Prompt</label>
-              <select class="form-select" onchange="state.selectedPromptId=this.value;state.quickGenValues={};renderActiveView();">
-                ${state.prompts.map(p => `<option value="${p.prompt_id}" ${p.prompt_id === selected.prompt_id ? 'selected' : ''}>${escapeHtml(p.prompt_code)} — ${escapeHtml(p.title)}</option>`).join('')}
-              </select>
-            </div>
-            <div class="row" style="justify-content:flex-end;">
-              <span class="code-tag">${escapeHtml(selected.prompt_code)}</span>
-              <span class="badge badge-navy">${escapeHtml(selected.current_version || 'v1.0')}</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="grid-2">
-          <div class="card">
-            <div class="card-header">
-              <div class="card-title">Prompt Placeholders (${tokens.length})</div>
-              <button class="btn btn-sm btn-outline" onclick="state.quickGenValues={};renderActiveView();">Clear</button>
-            </div>
-            ${tokens.map((tok, idx) => `
-              <div class="form-group">
-                <label class="form-label">${idx + 1}. [${escapeHtml(tok)}] ${counts[tok] > 1 ? `(×${counts[tok]})` : ''}</label>
-                <input class="form-input" type="text" value="${escapeHtml(state.quickGenValues[tok] || '')}" oninput="updateQuickGenValue('${escapeHtml(tok)}', this.value)" />
-              </div>
-            `).join('')}
-            ${tokens.length === 0 ? `<div class="callout info">No placeholders detected in this prompt body.</div>` : ''}
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <div class="card-title">${showingOriginal ? 'Original Prompt' : 'Completed Prompt'}</div>
-              <div class="row">
-                <button class="btn btn-sm ${!showingOriginal ? 'btn-primary' : 'btn-outline'}" onclick="state.quickGenViewMode='assembled';renderActiveView();">Assembled</button>
-                <button class="btn btn-sm ${showingOriginal ? 'btn-primary' : 'btn-outline'}" onclick="state.quickGenViewMode='original';renderActiveView();">Original</button>
-              </div>
-            </div>
-            <div id="qg-output-block" class="prompt-block">${showingOriginal ? escapeHtml(selected.prompt_body) : renderHighlightedPromptHtml(selected.prompt_body, tokens, state.quickGenValues)}</div>
-            <div class="row" style="justify-content:flex-end;margin-top:12px;">
-              <button class="btn btn-gold" onclick="copyAssembledPrompt()">Copy Completed Prompt</button>
-            </div>
-          </div>
-        </div>
-      `;
+        <div class="page-header"><div><h1>Prompt Detail & Quick Generate</h1><p class="page-subtitle">Fill in the prompt variables and copy a completed prompt. No external AI API call is made here.</p></div><div class="header-actions"><button class="btn btn-outline" onclick="navigate('prompts')">← Back to Prompts</button></div></div>
+        <div class="card" style="margin-bottom:16px;"><div class="grid-2" style="align-items:end;"><div class="form-group" style="margin-bottom:0;"><label class="form-label">Select Master Prompt</label><select class="form-select" onchange="state.selectedPromptId=this.value;state.quickGenValues={};renderActiveView();">${availablePrompts.map(p=>`<option value="${p.prompt_id}" ${p.prompt_id===selected.prompt_id?'selected':''}>${escapeHtml(p.prompt_code)} — ${escapeHtml(p.title)}</option>`).join('')}</select></div><div class="row" style="justify-content:flex-end;"><span class="code-tag">${escapeHtml(selected.prompt_code)}</span><span class="badge badge-navy">${escapeHtml(selected.current_version || 'v1.0')}</span>${promptPlatforms(selected).map(x=>`<span class="badge badge-gold">${escapeHtml(x)}</span>`).join('')}</div></div></div>
+        <div class="grid-2"><div class="card"><div class="card-header"><div class="card-title">Configure Prompt (${fields.length} inputs)</div><button class="btn btn-sm btn-outline" onclick="state.quickGenValues={};renderActiveView();">Clear</button></div>${inputHtml || '<div class="callout info">No input fields configured and no [PLACEHOLDER] tokens were detected. You can still copy the original prompt.</div>'}<div class="card-meta">Fields marked * are required before copying.</div></div>
+        <div class="card"><div class="card-header"><div class="card-title">${showingOriginal?'Original Prompt':'Completed Prompt'}</div><div class="row"><button class="btn btn-sm ${!showingOriginal?'btn-primary':'btn-outline'}" onclick="state.quickGenViewMode='assembled';renderActiveView();">Completed</button><button class="btn btn-sm ${showingOriginal?'btn-primary':'btn-outline'}" onclick="state.quickGenViewMode='original';renderActiveView();">Original</button></div></div><div id="qg-output-block" class="prompt-block">${escapeHtml(output)}</div><div class="row" style="justify-content:flex-end;margin-top:12px;"><button class="btn btn-gold" onclick="copyAssembledPrompt()" ${missing.length?'disabled':''}>Copy Completed Prompt</button></div>${missing.length?`<div class="callout gold" style="margin-top:10px;">Complete required fields: ${missing.map(f=>escapeHtml(f.label)).join(', ')}</div>`:''}</div></div>`;
     }
 
     function updateQuickGenValue(token, value) {
+      state.quickGenValues = state.quickGenValues || {};
       state.quickGenValues[token] = value;
       const selected = state.prompts.find(p => p.prompt_id === state.selectedPromptId);
-      const { tokens } = extractPlaceholders(selected.prompt_body);
       const out = document.getElementById('qg-output-block');
-      if (out && state.quickGenViewMode !== 'original') {
-        out.innerHTML = renderHighlightedPromptHtml(selected.prompt_body, tokens, state.quickGenValues);
-      }
+      if (selected && out && state.quickGenViewMode !== 'original') out.textContent = getQuickGenerateOutput(selected);
     }
 
     function copyAssembledPrompt() {
       const selected = state.prompts.find(p => p.prompt_id === state.selectedPromptId);
-      const { tokens } = extractPlaceholders(selected.prompt_body);
-      const text = substituteApprovedPlaceholders(selected.prompt_body, tokens, state.quickGenValues);
-      copyText(text, `Copied assembled ${selected.prompt_code} to clipboard.`);
+      if (!selected) return;
+      const fields = getQuickGenerateFields(selected);
+      const missing = fields.filter(f=>f.required && !String((state.quickGenValues||{})[f.key]||'').trim());
+      if (missing.length) return showToast('Complete all required fields before copying.','error');
+      copyText(getQuickGenerateOutput(selected), `Copied completed ${selected.prompt_code} prompt.`);
     }
 
     function renderUmiilawPipeline() {
