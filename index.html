@@ -922,6 +922,11 @@
         return this.execute('cms_deleteRecordPermanent', { contentId: contentId, confirmation: confirmation });
       },
 
+      savePrompt(prompt) { return this.execute('prompts_save', { prompt: prompt }); },
+      archivePrompt(promptId) { return this.execute('prompts_archive', { promptId: promptId }); },
+      restorePrompt(promptId) { return this.execute('prompts_restore', { promptId: promptId }); },
+      deletePrompt(promptId, confirmation) { return this.execute('prompts_deletePermanent', { promptId: promptId, confirmation: confirmation }); },
+
       uploadResource(metadata, fileData) {
         return this.execute('resources_uploadFile', { metadata: metadata, base64Data: fileData });
       },
@@ -2121,65 +2126,69 @@
 
     function renderFounderCms() {
       if (!isFounder()) return `<div class="card">Founder role required.</div>`;
-
+      const isPrompts = state.cmsCategory === 'prompts';
+      const records = isPrompts ? (state.prompts || []) : (state.cmsRecords || []).filter(r => state.cmsCategory === 'sops' ? r.module === 'SOPs' : r.module !== 'SOPs');
       return `
-        <div class="page-header">
-          <div>
-            <h1>Founder Content Management Studio</h1>
-            <p class="page-subtitle">Dedicated CRUD studio managing SOPs, Prompts, Announcements, and Design Settings backed by Google Sheets.</p>
-          </div>
-          <div class="header-actions">
-            <button class="btn btn-gold" onclick="openNewCmsItemModal()">+ Create Record</button>
-          </div>
-        </div>
-
+        <div class="page-header"><div><h1>Founder Content Management Studio</h1><p class="page-subtitle">One consistent workspace to create, edit, publish, archive, restore, and permanently delete Knowledge Hub content.</p></div><div class="header-actions"><button class="btn btn-gold" onclick="${isPrompts ? 'openPromptEditor()' : 'openCmsEditor()'}">+ Create ${isPrompts ? 'Prompt' : 'Content'}</button></div></div>
         <div class="tabs">
-          <button class="tab-btn ${state.cmsCategory === 'prompts' ? 'active' : ''}" onclick="state.cmsCategory='prompts';renderActiveView();">Prompts</button>
+          <button class="tab-btn ${isPrompts ? 'active' : ''}" onclick="state.cmsCategory='prompts';renderActiveView();">Prompts</button>
           <button class="tab-btn ${state.cmsCategory === 'sops' ? 'active' : ''}" onclick="state.cmsCategory='sops';renderActiveView();">SOPs</button>
+          <button class="tab-btn ${state.cmsCategory === 'cms' ? 'active' : ''}" onclick="state.cmsCategory='cms';renderActiveView();">Other CMS Content</button>
         </div>
-
-        <div class="card">
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Code / Title</th>
-                  <th>Category</th>
-                  <th>Version</th>
-                  <th>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${state.prompts.map(p => `
-                  <tr>
-                    <td><strong>${escapeHtml(p.prompt_code)}</strong> — ${escapeHtml(p.title)}</td>
-                    <td>${escapeHtml(p.category)}</td>
-                    <td>${escapeHtml(p.current_version || 'v1.0')}</td>
-                    <td><span class="badge ${p.status === 'published' ? 'badge-success' : 'badge-gold'}">${escapeHtml((p.status || 'draft').toUpperCase())}</span></td>
-                    <td>
-                      <button class="btn btn-sm btn-outline" onclick="archivePromptRecord('${p.prompt_id}')">Archive</button>
-                    </td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      `;
+        <div class="card"><div class="table-wrap"><table><thead><tr>${isPrompts ? '<th>Code / Title</th><th>Category</th><th>AI Platforms</th><th>Version</th>' : '<th>Title</th><th>Module</th><th>Type</th><th>Order</th>'}<th>Status</th><th>Actions</th></tr></thead><tbody>
+        ${records.map(r => { const status = String(r.status || 'draft').toLowerCase(); const id = isPrompts ? r.prompt_id : r.content_id; return `<tr>
+          ${isPrompts ? `<td><strong>${escapeHtml(r.prompt_code || '')}</strong><div>${escapeHtml(r.title || '')}</div></td><td>${escapeHtml(r.category || '')}</td><td>${escapeHtml(promptPlatforms(r).join(', '))}</td><td>${escapeHtml(r.current_version || '1')}</td>` : `<td><strong>${escapeHtml(r.title || '')}</strong><div class="card-meta">${escapeHtml(r.description || '')}</div></td><td>${escapeHtml(r.module || '')}</td><td>${escapeHtml(r.content_type || '')}</td><td>${escapeHtml(r.display_order || 0)}</td>`}
+          <td><span class="badge ${status === 'published' ? 'badge-success' : status === 'archived' ? 'badge-danger' : 'badge-gold'}">${escapeHtml(status.toUpperCase())}</span></td><td style="white-space:nowrap"><button class="btn btn-sm btn-outline" onclick="${isPrompts ? `openPromptEditor('${id}')` : `openCmsEditor('${id}')`}">Edit</button> ${status === 'archived' ? `<button class="btn btn-sm btn-outline" onclick="${isPrompts ? `restorePromptRecord('${id}')` : `restoreCmsRecord('${id}')`}">Restore</button>` : `<button class="btn btn-sm btn-outline" onclick="${isPrompts ? `archivePromptRecord('${id}')` : `archiveCmsRecord('${id}')`}">Archive</button>`} <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="${isPrompts ? `deletePromptRecord('${id}')` : `deleteCmsRecord('${id}')`}">Delete</button></td></tr>`; }).join('')}
+        </tbody></table>${records.length ? '' : '<div style="padding:18px;color:var(--text-muted)">No records in this section yet.</div>'}</div></div>`;
     }
 
-    async function archivePromptRecord(promptId) {
-      if (!confirm('Archive this prompt?')) return;
-      try {
-        await BackendAdapter.archiveCmsRecord(promptId);
-        showToast('Prompt archived.', 'success');
-        await loadInitialAppData();
-        renderActiveView();
-      } catch (err) {
-        showToast('Archive failed: ' + err.message, 'error');
-      }
+    function promptPlatforms(p) { try { const v = JSON.parse(p.platforms_json || '[]'); return Array.isArray(v) ? v : []; } catch(e) { return []; } }
+    function field(id, label, value, type='text', placeholder='') { return `<div class="form-group"><label class="form-label">${label}</label><input id="${id}" class="form-input" type="${type}" value="${escapeHtml(value || '')}" placeholder="${placeholder}"></div>`; }
+    function area(id, label, value, rows=5) { return `<div class="form-group"><label class="form-label">${label}</label><textarea id="${id}" class="form-input" rows="${rows}" style="min-height:${rows*28}px">${escapeHtml(value || '')}</textarea></div>`; }
+    function openPromptEditor(promptId) {
+      if (!isFounder()) return;
+      const p = (state.prompts || []).find(x => x.prompt_id === promptId) || {};
+      const platforms = promptPlatforms(p);
+      openModal(promptId ? 'Edit Prompt' : 'Create Prompt', `
+        ${field('pr-code','Prompt Code',p.prompt_code)}${field('pr-title','Title',p.title)}${field('pr-category','Category',p.category)}
+        ${area('pr-description','Description',p.description,2)}${area('pr-when','When to Use',p.when_to_use,2)}${area('pr-inputs','Required Inputs',p.required_inputs,3)}
+        ${area('pr-body','Prompt Body',p.prompt_body,10)}
+        <div class="form-group"><label class="form-label">Recommended AI Platforms</label><div class="row" style="gap:14px;flex-wrap:wrap">${['ChatGPT','Gemini','NotebookLM'].map(x=>`<label><input type="checkbox" name="pr-platform" value="${x}" ${platforms.includes(x)?'checked':''}> ${x}</label>`).join('')}</div></div>
+        ${area('pr-quick-schema','Quick Generate Configuration (JSON)',p.quick_generate_schema_json || '',4)}
+        <div class="form-group"><label class="form-label">Status</label><select id="pr-status" class="form-select"><option value="draft" ${p.status==='draft'?'selected':''}>Draft</option><option value="published" ${p.status==='published'?'selected':''}>Published</option></select></div>
+        ${field('pr-change-summary','Version Change Summary',promptId ? 'Updated prompt content' : 'Initial version')}
+        <input type="hidden" id="pr-id" value="${escapeHtml(promptId || '')}">`,
+        `<button class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="savePromptFromEditor()">Save Prompt</button>`);
     }
+    async function savePromptFromEditor() {
+      const id = document.getElementById('pr-id').value;
+      const platforms = Array.from(document.querySelectorAll('input[name="pr-platform"]:checked')).map(x=>x.value);
+      const prompt = { prompt_id:id, prompt_code:document.getElementById('pr-code').value.trim(), title:document.getElementById('pr-title').value.trim(), category:document.getElementById('pr-category').value.trim(), description:document.getElementById('pr-description').value, when_to_use:document.getElementById('pr-when').value, required_inputs:document.getElementById('pr-inputs').value, prompt_body:document.getElementById('pr-body').value, platforms_json:JSON.stringify(platforms), quick_generate_schema_json:document.getElementById('pr-quick-schema').value, status:document.getElementById('pr-status').value, change_summary:document.getElementById('pr-change-summary').value };
+      if (!prompt.title || !prompt.prompt_body) return showToast('Prompt title and body are required.','error');
+      try { await BackendAdapter.savePrompt(prompt); closeModal(); await loadInitialAppData(); renderActiveView(); showToast('Prompt saved.','success'); } catch(e) { showToast('Prompt save failed: '+e.message,'error'); }
+    }
+    function openCmsEditor(contentId) {
+      if (!isFounder()) return;
+      const r = (state.cmsRecords || []).find(x=>x.content_id===contentId) || {};
+      openModal(contentId ? 'Edit CMS Content' : 'Create CMS Content', `
+        ${field('cms-title','Title',r.title)}${field('cms-description','Description',r.description)}
+        <div class="form-group"><label class="form-label">Module</label><select id="cms-module" class="form-select">${['Dashboard','Announcements','SOPs','Workflows','Learning Standards','Operational Guidelines','General Resources','Dashboard Sections','Founder Notices','Help and Instructions'].map(x=>`<option ${r.module===x?'selected':''}>${x}</option>`).join('')}</select></div>
+        <div class="form-group"><label class="form-label">Content Type</label><select id="cms-type" class="form-select">${['Text','Rich Text','Announcement','Card','Link','Image','HTML Section','Instruction','Checklist'].map(x=>`<option ${r.content_type===x?'selected':''}>${x}</option>`).join('')}</select></div>
+        ${field('cms-section','Section',r.section)}${area('cms-body','Content Body (HTML allowed for authorized CMS content)',r.content_body,8)}${field('cms-image','Image URL',r.image_url)}${field('cms-link','Link URL',r.link_url)}${field('cms-order','Display Order',r.display_order || 0,'number')}
+        <div class="form-group"><label class="form-label">Status</label><select id="cms-status" class="form-select"><option value="draft" ${r.status==='draft'?'selected':''}>Draft</option><option value="published" ${r.status==='published'?'selected':''}>Published</option></select></div><input id="cms-id" type="hidden" value="${escapeHtml(contentId||'')}">`,
+        `<button class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveCmsFromEditor()">Save Content</button>`);
+    }
+    async function saveCmsFromEditor() {
+      const record={content_id:document.getElementById('cms-id').value,module:document.getElementById('cms-module').value,title:document.getElementById('cms-title').value.trim(),description:document.getElementById('cms-description').value,content_type:document.getElementById('cms-type').value,section:document.getElementById('cms-section').value,content_body:document.getElementById('cms-body').value,image_url:document.getElementById('cms-image').value,link_url:document.getElementById('cms-link').value,display_order:document.getElementById('cms-order').value,status:document.getElementById('cms-status').value};
+      if(!record.title) return showToast('Content title is required.','error');
+      try { await BackendAdapter.saveCmsRecord(record); closeModal(); await loadInitialAppData(); renderActiveView(); showToast('Content saved.','success'); } catch(e) { showToast('Save failed: '+e.message,'error'); }
+    }
+    async function archiveCmsRecord(id) { if(!confirm('Archive this content?'))return; try{await BackendAdapter.archiveCmsRecord(id);await loadInitialAppData();renderActiveView();showToast('Content archived.','success');}catch(e){showToast(e.message,'error');} }
+    async function restoreCmsRecord(id) { try{await BackendAdapter.restoreCmsRecord(id);await loadInitialAppData();renderActiveView();showToast('Content restored as draft.','success');}catch(e){showToast(e.message,'error');} }
+    async function deleteCmsRecord(id) { const c=prompt('Type PERMANENTLY DELETE to permanently delete this CMS record.');if(c!=='PERMANENTLY DELETE')return;try{await BackendAdapter.deleteCmsRecord(id,c);await loadInitialAppData();renderActiveView();showToast('Content permanently deleted.','success');}catch(e){showToast(e.message,'error');} }
+    async function archivePromptRecord(id) { if(!confirm('Archive this prompt?'))return;try{await BackendAdapter.archivePrompt(id);await loadInitialAppData();renderActiveView();showToast('Prompt archived.','success');}catch(e){showToast(e.message,'error');} }
+    async function restorePromptRecord(id) { try{await BackendAdapter.restorePrompt(id);await loadInitialAppData();renderActiveView();showToast('Prompt restored as draft.','success');}catch(e){showToast(e.message,'error');} }
+    async function deletePromptRecord(id) { const c=prompt('Type PERMANENTLY DELETE to permanently delete this prompt.');if(c!=='PERMANENTLY DELETE')return;try{await BackendAdapter.deletePrompt(id,c);await loadInitialAppData();renderActiveView();showToast('Prompt permanently deleted.','success');}catch(e){showToast(e.message,'error');} }
 
     function renderUserManagement() {
       if (!isFounder()) return `<div class="card">Founder role required.</div>`;
